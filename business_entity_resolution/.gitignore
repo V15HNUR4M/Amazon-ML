@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Generated artefacts — do NOT commit
+cache/*
+output/*
+!cache/.gitkeep
+!output/.gitkeep
+
+# Trained model files and databases
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.onnx
+*.db
+*.db-wal
+*.db-shm
+
+# macOS
+.DS_Store
+._.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
