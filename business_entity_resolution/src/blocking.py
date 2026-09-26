@@ -813,7 +813,7 @@ class DiskBlockingIndex:
         self, candidate_ids: list[str] | set[str] | np.ndarray
     ) -> list[dict[str, Any]]:
         """Fetch candidate feature records for feature computation."""
-        id_list = list(candidate_ids) if not isinstance(candidate_ids, list) else candidate_ids
+        id_list = list(dict.fromkeys(candidate_ids))
         if not id_list:
             return []
 
@@ -842,6 +842,88 @@ class DiskBlockingIndex:
                 rec["is_domain"] = bool(rec["is_domain"])
                 results.append(rec)
         return results
+
+    def add_ground_truth(
+        self, gt: pd.DataFrame | list[dict[str, Any]] | dict[str, Any]
+    ) -> None:
+        """Store ground truth match mapping in SQLite for memory-efficient chunked lookup."""
+        if gt is None or len(gt) == 0:
+            return
+
+        if self.conn is None:
+            self.conn = sqlite3.connect(str(self.db_path))
+            self._setup_pragmas()
+
+        cur = self.conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS ground_truth (
+                s1_id TEXT PRIMARY KEY,
+                matched_ids TEXT
+            )"""
+        )
+
+        if isinstance(gt, pd.DataFrame):
+            s1_col = "source1_entity_id" if "source1_entity_id" in gt.columns else "s1_id"
+            m_col = "matched_entity_ids" if "matched_entity_ids" in gt.columns else "matched_ids"
+            s1_series = gt[s1_col].astype(str)
+            m_series = gt[m_col].fillna("").astype(str) if m_col in gt.columns else pd.Series([""] * len(gt))
+            rows = list(zip(s1_series, m_series))
+        elif isinstance(gt, dict):
+            rows = []
+            for k, v in gt.items():
+                if isinstance(v, (set, list, tuple)):
+                    val = ",".join(str(x) for x in v if str(x).strip())
+                else:
+                    val = str(v or "")
+                rows.append((str(k), val))
+        else:
+            rows = [
+                (
+                    str(r.get("source1_entity_id") or r.get("s1_id")),
+                    str(r.get("matched_entity_ids") or r.get("matched_ids") or ""),
+                )
+                for r in gt
+            ]
+
+        cur.executemany("INSERT OR REPLACE INTO ground_truth VALUES (?, ?)", rows)
+        self.conn.commit()
+        self._has_ground_truth = True
+
+    def get_ground_truth_for_s1(self, s1_ids: list[str] | set[str]) -> dict[str, set[str]]:
+        """Fetch ground truth mapping for a batch of S1 IDs from SQLite."""
+        id_list = list(dict.fromkeys(s1_ids))
+        if not id_list:
+            return {}
+
+        if self.conn is None:
+            self.conn = sqlite3.connect(str(self.db_path))
+            self._setup_pragmas()
+
+        cur = self.conn.cursor()
+        if not getattr(self, "_has_ground_truth", False):
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ground_truth'")
+            if not cur.fetchone():
+                return {s1_id: set() for s1_id in id_list}
+            self._has_ground_truth = True
+
+        result: dict[str, set[str]] = {s1_id: set() for s1_id in id_list}
+        batch_size = 500
+        for i in range(0, len(id_list), batch_size):
+            chunk = id_list[i : i + batch_size]
+            placeholders = ",".join("?" for _ in chunk)
+            cur.execute(
+                f"SELECT s1_id, matched_ids FROM ground_truth WHERE s1_id IN ({placeholders})",
+                chunk,
+            )
+            for s1_id, m_str in cur.fetchall():
+                if m_str:
+                    result[s1_id] = {
+                        m.strip()
+                        for m in str(m_str).split(",")
+                        if m.strip() and m.strip().lower() not in ("nan", "none", "null")
+                    }
+
+        return result
 
     def get(self, entity_id: str, default: Any = None) -> Optional[dict[str, Any]]:
         """Dictionary-compatible lookup for a single entity_id."""

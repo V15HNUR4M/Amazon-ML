@@ -180,13 +180,14 @@ class MatcherBase:
                 raise ValueError(
                     f"Expected {len(self.feature_names)} features, got {X.shape[1]}"
                 )
-            mat = X.astype(np.float32)
+            mat = X if X.dtype == np.float32 else X.astype(np.float32, copy=False)
         else:
             raise TypeError(f"Unsupported feature container: {type(X)}")
 
         # Handle any residual NaNs by imputing 0.0
-        if np.isnan(mat).any():
-            mat = np.nan_to_num(mat, nan=0.0)
+        if not isinstance(mat, np.memmap):
+            if np.isnan(mat).any():
+                mat = np.nan_to_num(mat, nan=0.0, copy=False)
 
         return mat
 
@@ -337,7 +338,7 @@ class LightGBMMatcher(MatcherBase):
         import lightgbm as lgb
 
         X_mat = self._extract_feature_matrix(X)
-        y_vec = np.asarray(y, dtype=int)
+        y_vec = np.asarray(y, dtype=np.int32)
 
         self.clf = lgb.LGBMClassifier(
             objective="binary",
