@@ -181,7 +181,7 @@ class GPUBlockingConfig:
     max_candidates_per_block: int = 150  # Cap posting list size
     min_token_len: int = 3
     min_compact_len: int = 4
-    top_k_per_s1: int = 60  # Max candidates per S1 entity (increased for higher recall)
+    top_k_per_s1: int = 120  # Max candidates per S1 entity (increased to prevent tie-truncation on large corpus)
     rare_token_max_freq: int = 25  # Max corpus frequency for rare-token blocker
     device: str = "auto"  # 'auto', 'cuda', or 'cpu'
     name_stopwords: frozenset[str] = field(default_factory=lambda: NAME_STOPWORDS)
@@ -195,9 +195,9 @@ class GPUBlockingConfig:
             enable_blocker_b=getattr(cfg, "BLOCKER_B_ENABLED", True),
             enable_blocker_c=getattr(cfg, "BLOCKER_C_ENABLED", True),
             enable_blocker_d=getattr(cfg, "BLOCKER_D_ENABLED", True),
-            max_candidates_per_block=150,
+            max_candidates_per_block=getattr(cfg, "MAX_CANDIDATES_PER_BLOCK", 150),
             min_token_len=getattr(cfg, "MIN_TOKEN_LEN", 3),
-            top_k_per_s1=60,
+            top_k_per_s1=getattr(cfg, "TOP_K_PER_S1", getattr(cfg, "BLOCKING_TOP_K", 120)),
         )
 
 
@@ -358,6 +358,61 @@ def generate_gpu_blocking_keys(
     return keys
 
 
+def compute_key_frequency_discount(
+    key: str,
+    token_freq: Optional[Counter[str] | dict[str, int]] = None,
+    local_plist_len: int = 1,
+) -> float:
+    """Calculate IDF-like key frequency discount.
+
+    Prefers precomputed global corpus token frequencies to prevent shard-boundary
+    distortion. Falls back to local posting list length when global vocab is unavailable.
+    """
+    if token_freq:
+        if key.startswith("b_tok:"):
+            tok = key[6:]
+            g = token_freq.get(tok, local_plist_len)
+            if g <= 100:
+                return 1.0
+            elif g <= 500:
+                return 0.9
+            elif g <= 2500:
+                return 0.7
+            elif g <= 10000:
+                return 0.5
+            else:
+                return 0.35
+        elif key.startswith("b_bi:") or key.startswith("b_lead_bi:"):
+            parts = key.split(":", 1)[1].split("_")
+            if len(parts) >= 2:
+                g = min(token_freq.get(parts[0], local_plist_len), token_freq.get(parts[1], local_plist_len))
+                if g <= 500:
+                    return 1.0
+                elif g <= 2500:
+                    return 0.85
+                else:
+                    return 0.6
+            return 0.8
+        elif key.startswith("c_addr_bi:"):
+            parts = key.split(":", 1)[1].split("_")
+            if len(parts) >= 2:
+                g = max(token_freq.get(parts[0], local_plist_len), token_freq.get(parts[1], local_plist_len))
+                if g <= 1000:
+                    return 1.0
+                elif g <= 5000:
+                    return 0.75
+                else:
+                    return 0.4
+            return 0.8
+        elif key.startswith("b_rare:") or key.startswith("a_") or key.startswith("d_"):
+            return 1.0
+        elif key.startswith("c_num_w:") or key.startswith("c_zip_w:"):
+            return 1.0
+
+    # Fallback to local plist length
+    return 1.0 if local_plist_len <= 10 else (0.8 if local_plist_len <= 50 else 0.5)
+
+
 class GPUBlockingIndex:
     """In-memory inverted index with GPU/cuDF support and fast vectorized CPU fallback."""
 
@@ -417,16 +472,15 @@ class GPUBlockingIndex:
         }
 
         candidate_scores: dict[str, float] = defaultdict(float)
-        cap = self.config.max_candidates_per_block
 
         for blocker_tag, key_list in keys_by_blocker.items():
             base_w = blocker_weights.get(blocker_tag, 1)
             for k in key_list:
                 plist = self.index.get(k)
-                if not plist or len(plist) >= cap:
+                if not plist:
                     continue
-                # Inverse posting list frequency weighting
-                freq_discount = 1.0 if len(plist) <= 10 else (0.8 if len(plist) <= 50 else 0.5)
+                # Global / inverse posting list frequency weighting
+                freq_discount = compute_key_frequency_discount(k, self.token_freq, len(plist))
                 score_increment = base_w * freq_discount
                 for cid in plist:
                     candidate_scores[cid] += score_increment
@@ -1072,11 +1126,15 @@ class ShardedReferenceIndex:
                 fname,
             )
 
+        s2_count = 0
+        s3_count = 0
         for df in dfs:
             if df is None or len(df) == 0:
                 continue
             proc_df = df if "name_norm" in df.columns else preprocess_records(df, n_jobs=4)
             total_records += len(proc_df)
+            s2_count += int(proc_df["entity_id"].astype(str).str.startswith("S2").sum())
+            s3_count += int(proc_df["entity_id"].astype(str).str.startswith("S3").sum())
 
             if leftover_df is not None and len(leftover_df) > 0:
                 proc_df = pd.concat([leftover_df, proc_df], ignore_index=True)
@@ -1098,6 +1156,8 @@ class ShardedReferenceIndex:
         self._meta = {
             "n_shards": shard_idx,
             "total_records": total_records,
+            "s2_records": s2_count,
+            "s3_records": s3_count,
             "shard_size": self.shard_size,
             "shard_files": shard_files,
         }
@@ -1147,10 +1207,27 @@ class ShardedReferenceIndex:
         if meta_path.exists() and not overwrite:
             with open(meta_path, "r", encoding="utf-8") as f:
                 self._meta = json.load(f)
+            # Ensure s2_records and s3_records exist in cached meta
+            if "s2_records" not in self._meta or "s3_records" not in self._meta:
+                s2_c = 0
+                s3_c = 0
+                for fname in self._meta.get("shard_files", []):
+                    sp = self.shard_dir / fname
+                    if sp.exists():
+                        sdf = pd.read_parquet(sp, columns=["entity_id"])
+                        s2_c += int(sdf["entity_id"].astype(str).str.startswith("S2").sum())
+                        s3_c += int(sdf["entity_id"].astype(str).str.startswith("S3").sum())
+                        del sdf
+                self._meta["s2_records"] = s2_c
+                self._meta["s3_records"] = s3_c
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(self._meta, f, indent=2)
             logger.info(
-                "ShardedReferenceIndex: loaded existing %d shards (%d total records) from %s",
+                "ShardedReferenceIndex: loaded existing %d shards (%d total records, S2: %d, S3: %d) from %s",
                 self._meta.get("n_shards", 0),
                 self._meta.get("total_records", 0),
+                self._meta.get("s2_records", 0),
+                self._meta.get("s3_records", 0),
                 self.shard_dir,
             )
             return self._meta
@@ -1169,6 +1246,8 @@ class ShardedReferenceIndex:
 
         shard_idx = 0
         total_records = 0
+        s2_count = 0
+        s3_count = 0
         shard_files: list[str] = []
         leftover_df: Optional[pd.DataFrame] = None
 
@@ -1214,6 +1293,8 @@ class ShardedReferenceIndex:
                 proc_chunk = preprocess_records(raw_chunk, in_place=True, n_jobs=n_jobs)
                 del raw_chunk
                 total_records += len(proc_chunk)
+                s2_count += int(proc_chunk["entity_id"].astype(str).str.startswith("S2").sum())
+                s3_count += int(proc_chunk["entity_id"].astype(str).str.startswith("S3").sum())
 
                 # Prepend any leftover rows from the previous chunk
                 if leftover_df is not None and len(leftover_df) > 0:
@@ -1240,6 +1321,8 @@ class ShardedReferenceIndex:
         self._meta = {
             "n_shards": shard_idx,
             "total_records": total_records,
+            "s2_records": s2_count,
+            "s3_records": s3_count,
             "shard_size": self.shard_size,
             "shard_files": shard_files,
         }
@@ -1428,12 +1511,9 @@ class ShardedReferenceIndex:
                     base_w = blocker_weights.get(blocker_tag, 1)
                     for k in key_list:
                         plist = shard_inv.get(k)
-                        if not plist or len(plist) >= cap:
+                        if not plist:
                             continue
-                        freq_discount = (
-                            1.0 if len(plist) <= 10
-                            else (0.8 if len(plist) <= 50 else 0.5)
-                        )
+                        freq_discount = compute_key_frequency_discount(k, self.token_freq, len(plist))
                         score_inc = base_w * freq_discount
                         for cid in plist:
                             global_scores[s1_id][cid] += score_inc

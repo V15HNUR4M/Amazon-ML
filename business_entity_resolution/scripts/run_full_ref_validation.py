@@ -366,7 +366,7 @@ def main() -> None:
     parser.add_argument("--s1-count", type=int, default=None, help="Override S1 count (default: 5k for A, 10k for B).")
     parser.add_argument("--shard-size", type=int, default=200_000, help="Reference records per shard (default: 200000).")
     parser.add_argument("--s1-batch-size", type=int, default=2500, help="S1 query batch size (default: 2500 for full-ref).")
-    parser.add_argument("--top-k", type=int, default=60)
+    parser.add_argument("--top-k", type=int, default=120)
     parser.add_argument("--val-size", type=float, default=0.20)
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=None)

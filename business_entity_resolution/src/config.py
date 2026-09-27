@@ -82,8 +82,9 @@ class Config:
     # ------------------------------------------------------------------
 
     # Blocking
-    BLOCKING_TOP_K: int = 50                 # max candidates per S1 entity
-    MAX_CANDIDATES_PER_BLOCK: int = 100      # max posting list size per block to prevent explosion
+    BLOCKING_TOP_K: int = 120                # max candidates per S1 entity (increased for 10M-scale corpus)
+    TOP_K_PER_S1: int = 120                  # alias for BLOCKING_TOP_K
+    MAX_CANDIDATES_PER_BLOCK: int = 150      # max posting list size per block to prevent explosion
     MIN_TOKEN_LEN: int = 3
     BLOCKER_A_ENABLED: bool = True           # Exact normalized, compact, no-suffix, domain stem
     BLOCKER_B_ENABLED: bool = True           # Selective token blocks

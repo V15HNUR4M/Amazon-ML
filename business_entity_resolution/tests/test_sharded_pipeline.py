@@ -379,3 +379,137 @@ def test_sharded_resume_capability(small_sample_200):
     finally:
         gp_module.compute_gpu_features = orig_feat
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Regression Test 1: Capped posting lists must not be discarded at query time
+# ---------------------------------------------------------------------------
+
+
+def test_capped_posting_list_queryable():
+    """Posting lists with len(plist) == cap must NOT be dropped at query time."""
+    from collections import Counter
+    from src.gpu.gpu_blocking import GPUBlockingConfig, GPUBlockingIndex, compute_key_frequency_discount
+
+    cfg = GPUBlockingConfig(max_candidates_per_block=10, top_k_per_s1=20)
+    idx = GPUBlockingIndex(config=cfg)
+
+    # Ingest 10 records with exact same name to reach cap
+    records = [
+        {"entity_id": f"S2-{i}", "business_name": "Apex Tech Solutions", "business_address": "123 Main St", "country": "US"}
+        for i in range(10)
+    ]
+    df = pd.DataFrame(records)
+    idx.add_records(preprocess_records(df))
+
+    # Posting list for exact name should have exactly 10 candidates (the cap)
+    k = "a_exact:apex tech solutions"
+    assert k in idx.index
+    assert len(idx.index[k]) == 10
+
+    # Query with S1 entity having the same name
+    s1_rec = {"entity_id": "S1-999", "business_name": "Apex Tech Solutions", "business_address": "123 Main St", "country": "US"}
+    s1_proc = preprocess_records(pd.DataFrame([s1_rec])).iloc[0]
+
+    cands = idx.query_entity(s1_proc)
+    # All 10 S2 candidates should be retrieved, NOT 0
+    assert len(cands) == 10, f"Expected 10 candidates from capped list, got {len(cands)}"
+    assert set(cands) == {f"S2-{i}" for i in range(10)}
+
+
+# ---------------------------------------------------------------------------
+# Regression Test 2: Top-k tie breaking and increased capacity
+# ---------------------------------------------------------------------------
+
+
+def test_sharded_top_k_tie_breaking():
+    """top_k_per_s1=120 retains candidates that tie at cutoff where top_k=60 cuts them off."""
+    from src.gpu.gpu_blocking import GPUBlockingConfig, ShardedReferenceIndex
+
+    tmp = tempfile.mkdtemp(prefix="test_topk_")
+    try:
+        # Create 100 S2 records with common token
+        s2_recs = [
+            {"entity_id": f"S2-{i:03d}", "business_name": f"Sharma Store {i}", "business_address": f"{i} Market Rd", "country": "India"}
+            for i in range(100)
+        ]
+        s2_proc = preprocess_records(pd.DataFrame(s2_recs))
+
+        # Build 2 shards of 50 records
+        idx = ShardedReferenceIndex(shard_dir=tmp, shard_size=50, config=GPUBlockingConfig(top_k_per_s1=120))
+        idx.build_shards(s2_proc, overwrite=True)
+
+        s1_rec = {"entity_id": "S1-001", "business_name": "Sharma Store Special", "business_address": "99 Market Rd", "country": "India"}
+        s1_proc = preprocess_records(pd.DataFrame([s1_rec]))
+        idx.build_global_vocab(s1_proc)
+
+        # With top_k=120: all 100 candidates matching 'sharma' should be retrieved
+        idx.config.top_k_per_s1 = 120
+        res120 = idx.query_s1_batch(s1_proc)
+        assert len(res120) == 100, f"Expected 100 candidates at top_k=120, got {len(res120)}"
+
+        # With top_k=60: hard-capped at 60
+        idx.config.top_k_per_s1 = 60
+        res60 = idx.query_s1_batch(s1_proc)
+        assert len(res60) == 60, f"Expected exactly 60 candidates at top_k=60, got {len(res60)}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Regression Test 3: Global token frequency discounting
+# ---------------------------------------------------------------------------
+
+
+def test_global_token_frequency_discount():
+    """compute_key_frequency_discount accurately applies global frequency discounting."""
+    from collections import Counter
+    from src.gpu.gpu_blocking import compute_key_frequency_discount
+
+    global_vocab = Counter({
+        "hyper_common": 50_000,
+        "common": 5_000,
+        "medium": 1_000,
+        "rare": 50,
+        "unique": 2,
+    })
+
+    # Rare tokens should get discount 1.0
+    assert compute_key_frequency_discount("b_tok:unique", global_vocab, local_plist_len=5) == 1.0
+    assert compute_key_frequency_discount("b_tok:rare", global_vocab, local_plist_len=5) == 1.0
+
+    # Hyper common token should receive strong discount regardless of local shard plist len
+    d_hyper = compute_key_frequency_discount("b_tok:hyper_common", global_vocab, local_plist_len=5)
+    assert d_hyper < 0.5, f"Expected discount < 0.5 for hyper common token, got {d_hyper}"
+
+    # Common token discount < medium token discount < rare token discount
+    d_common = compute_key_frequency_discount("b_tok:common", global_vocab, local_plist_len=5)
+    d_medium = compute_key_frequency_discount("b_tok:medium", global_vocab, local_plist_len=5)
+    assert d_hyper < d_common < d_medium <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Regression Test 4: S2 and S3 pool reporting integrity
+# ---------------------------------------------------------------------------
+
+
+def test_s2_s3_pool_reporting_integrity(small_sample_200):
+    """build_shards and ShardedReferenceIndex accurately record exact S2 and S3 pool counts."""
+    s1, s2, s3, gt = small_sample_200
+    s1_proc = preprocess_records(s1)
+    s2_proc = preprocess_records(s2)
+    s3_proc = preprocess_records(s3)
+
+    tmp = tempfile.mkdtemp(prefix="test_meta_reporting_")
+    try:
+        idx = ShardedReferenceIndex(shard_dir=tmp, shard_size=100)
+        meta = idx.build_shards(s2_proc, s3_proc, overwrite=True)
+
+        assert "s2_records" in meta, "s2_records must be in shard metadata"
+        assert "s3_records" in meta, "s3_records must be in shard metadata"
+        assert meta["s2_records"] == len(s2_proc), f"Expected s2_records={len(s2_proc)}, got {meta['s2_records']}"
+        assert meta["s3_records"] == len(s3_proc), f"Expected s3_records={len(s3_proc)}, got {meta['s3_records']}"
+        assert meta["total_records"] == len(s2_proc) + len(s3_proc)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+

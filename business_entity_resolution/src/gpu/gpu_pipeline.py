@@ -1408,6 +1408,8 @@ class Turn7Pipeline:
             "shard_dir": str(shard_dir),
             "n_shards": shard_meta["n_shards"],
             "ref_total_records": shard_meta["total_records"],
+            "s2_records": shard_meta.get("s2_records", 0),
+            "s3_records": shard_meta.get("s3_records", 0),
         }
         if self.config.resume and manifest_path.exists():
             try:
@@ -1664,8 +1666,8 @@ class Turn7Pipeline:
         ingestion_summary = {
             "source1_entities": len(s1_proc),
             "candidate_pool_size": ref_total,
-            "s2_pool": shard_meta.get("total_records", 0),  # approximation; exact counts in shard_meta
-            "s3_pool": 0,
+            "s2_pool": shard_meta.get("s2_records", shard_meta.get("total_records", 0)),
+            "s3_pool": shard_meta.get("s3_records", 0),
             "total_true_matches": total_true_matches,
             "s2_true_matches": s2_true_matches,
             "s3_true_matches": s3_true_matches,
