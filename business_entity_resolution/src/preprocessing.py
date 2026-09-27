@@ -343,6 +343,24 @@ DEFAULT_LEGAL_SUFFIXES: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 
+_SPLIT_PVT_LTD_REGEX = re.compile(
+    r"^\s*(?:pvt\.?|private)\s+(.*?)\s+(?:ltd\.?|limited)\.?\s*$",
+    re.IGNORECASE,
+)
+_DEFAULT_SUFFIX_END_REGEX = [
+    (canon, re.compile(r"[\s,]+(?:" + "|".join(re.escape(p) for p in patterns) + r")\.?\s*$", re.IGNORECASE))
+    for canon, patterns in DEFAULT_LEGAL_SUFFIXES
+]
+_DEFAULT_SUFFIX_START_REGEX = [
+    (canon, re.compile(r"^\s*(?:" + "|".join(re.escape(p) for p in patterns) + r")\.?[\s,]+", re.IGNORECASE))
+    for canon, patterns in DEFAULT_LEGAL_SUFFIXES
+]
+_DEFAULT_SUFFIX_MID_REGEX = [
+    (canon, re.compile(r"(?:^|[\s,]+)((?:" + "|".join(re.escape(p) for p in patterns) + r")\.?)(?:[\s,]+|$)", re.IGNORECASE))
+    for canon, patterns in DEFAULT_LEGAL_SUFFIXES
+]
+
+
 def extract_legal_suffix(
     name_str: Optional[str],
     suffixes: Optional[list[tuple[str, tuple[str, ...]]]] = None,
@@ -372,22 +390,47 @@ def extract_legal_suffix(
     if is_missing(name_str) or not name_str:
         return None, False, None
 
-    cfg_suffixes = suffixes if suffixes is not None else DEFAULT_LEGAL_SUFFIXES
     clean_target = name_str.strip()
 
     # 1. Check split prefix/suffix: e.g. 'Pvt. ... Ltd.' or 'Private ... Limited'
-    split_pvt_ltd = re.match(
-        r"^\s*(?:pvt\.?|private)\s+(.*?)\s+(?:ltd\.?|limited)\.?\s*$",
-        clean_target,
-        re.IGNORECASE,
-    )
+    split_pvt_ltd = _SPLIT_PVT_LTD_REGEX.match(clean_target)
     if split_pvt_ltd:
         inner = split_pvt_ltd.group(1).strip(" ,.-_")
         if inner:
             return "pvt_ltd", True, inner
 
-    # 2. Check suffix at end of name
-    for canon, patterns in cfg_suffixes:
+    if suffixes is None:
+        # Fast path using precompiled regex unions
+        for canon, rx in _DEFAULT_SUFFIX_END_REGEX:
+            end_match = rx.search(clean_target)
+            if end_match:
+                remainder = clean_target[: end_match.start()].strip(" ,.-_")
+                if remainder:
+                    return canon, True, remainder
+
+        for canon, rx in _DEFAULT_SUFFIX_START_REGEX:
+            start_match = rx.search(clean_target)
+            if start_match:
+                remainder = clean_target[start_match.end() :].strip(" ,.-_")
+                if remainder:
+                    return canon, True, remainder
+
+        for canon, rx in _DEFAULT_SUFFIX_MID_REGEX:
+            mid_match = rx.search(clean_target)
+            if mid_match:
+                remainder = (
+                    clean_target[: mid_match.start()]
+                    + " "
+                    + clean_target[mid_match.end() :]
+                ).strip(" ,.-_")
+                remainder = " ".join(remainder.split())
+                if remainder:
+                    return canon, True, remainder
+
+        return None, False, clean_target
+
+    # Fallback path for custom suffixes
+    for canon, patterns in suffixes:
         for pat in patterns:
             escaped = re.escape(pat)
             end_match = re.search(rf"[\s,]+{escaped}\.?\s*$", clean_target, re.IGNORECASE)
@@ -396,8 +439,7 @@ def extract_legal_suffix(
                 if remainder:
                     return canon, True, remainder
 
-    # 3. Check suffix at beginning of name
-    for canon, patterns in cfg_suffixes:
+    for canon, patterns in suffixes:
         for pat in patterns:
             escaped = re.escape(pat)
             start_match = re.search(rf"^\s*{escaped}\.?[\s,]+", clean_target, re.IGNORECASE)
@@ -406,8 +448,7 @@ def extract_legal_suffix(
                 if remainder:
                     return canon, True, remainder
 
-    # 4. Check suffix in middle with whitespace boundaries
-    for canon, patterns in cfg_suffixes:
+    for canon, patterns in suffixes:
         for pat in patterns:
             escaped = re.escape(pat)
             mid_match = re.search(
@@ -866,9 +907,15 @@ def normalize_address(text: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _preprocess_chunk_worker(chunk: pd.DataFrame) -> pd.DataFrame:
+    """Top-level worker function for multiprocessing chunks."""
+    return preprocess_records(chunk, in_place=True, n_jobs=1)
+
+
 def preprocess_records(
     df: pd.DataFrame,
     in_place: bool = False,
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
     """Apply field normalisations to a DataFrame or chunk of records.
 
@@ -897,6 +944,9 @@ def preprocess_records(
         entity_id, business_name, business_address, country.
     in_place:
         If True, mutate *df* directly to conserve RAM in Colab.
+    n_jobs:
+        Number of CPU processes to parallelize across (default: 1).
+        When > 1, chunks the DataFrame and distributes across workers.
 
     Returns
     -------
@@ -905,6 +955,18 @@ def preprocess_records(
     """
     if df is None:
         raise ValueError("Input DataFrame df cannot be None")
+
+    if n_jobs > 1 and len(df) >= 20_000:
+        import os
+        from concurrent.futures import ProcessPoolExecutor
+
+        actual_workers = min(n_jobs, os.cpu_count() or 1, len(df) // 10_000)
+        if actual_workers > 1:
+            chunk_size = (len(df) + actual_workers - 1) // actual_workers
+            chunks = [df.iloc[i : i + chunk_size].copy() for i in range(0, len(df), chunk_size)]
+            with ProcessPoolExecutor(max_workers=actual_workers) as executor:
+                results = list(executor.map(_preprocess_chunk_worker, chunks))
+            return pd.concat(results, ignore_index=True)
 
     target = df if in_place else df.copy()
 

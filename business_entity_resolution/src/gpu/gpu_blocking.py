@@ -1046,18 +1046,16 @@ class ShardedReferenceIndex:
         ]
 
         shard_idx = 0
-        shard_rows: list[dict] = []
         total_records = 0
         shard_files: list[str] = []
+        leftover_df: Optional[pd.DataFrame] = None
 
-        def _flush_shard() -> None:
-            nonlocal shard_idx, shard_rows
-            if not shard_rows:
+        def _write_shard(df_chunk: pd.DataFrame) -> None:
+            nonlocal shard_idx
+            if df_chunk is None or len(df_chunk) == 0:
                 return
-            shard_df = pd.DataFrame(shard_rows)
-            # Keep only available columns
-            keep = [c for c in COLS_TO_KEEP if c in shard_df.columns]
-            shard_df = shard_df[keep]
+            keep = [c for c in COLS_TO_KEEP if c in df_chunk.columns]
+            shard_df = df_chunk[keep]
             fname = f"ref_shard_{shard_idx:04d}.parquet"
             shard_df.to_parquet(
                 self.shard_dir / fname,
@@ -1066,27 +1064,36 @@ class ShardedReferenceIndex:
                 compression="snappy",
             )
             shard_files.append(fname)
-            logger.debug(
+            shard_idx += 1
+            logger.info(
                 "ShardedReferenceIndex: flushed shard %d with %d records -> %s",
-                shard_idx,
-                len(shard_rows),
+                shard_idx - 1,
+                len(shard_df),
                 fname,
             )
-            shard_idx += 1
-            shard_rows = []
 
         for df in dfs:
             if df is None or len(df) == 0:
                 continue
-            proc_df = df if "name_norm" in df.columns else preprocess_records(df)
-            records = proc_df.to_dict(orient="records")
-            for rec in records:
-                shard_rows.append(rec)
-                total_records += 1
-                if len(shard_rows) >= self.shard_size:
-                    _flush_shard()
+            proc_df = df if "name_norm" in df.columns else preprocess_records(df, n_jobs=4)
+            total_records += len(proc_df)
 
-        _flush_shard()  # flush remaining
+            if leftover_df is not None and len(leftover_df) > 0:
+                proc_df = pd.concat([leftover_df, proc_df], ignore_index=True)
+                leftover_df = None
+
+            n_full = len(proc_df) // self.shard_size
+            for i in range(n_full):
+                chunk = proc_df.iloc[i * self.shard_size : (i + 1) * self.shard_size]
+                _write_shard(chunk)
+
+            rem_start = n_full * self.shard_size
+            if rem_start < len(proc_df):
+                leftover_df = proc_df.iloc[rem_start:].copy()
+
+        if leftover_df is not None and len(leftover_df) > 0:
+            _write_shard(leftover_df)
+            leftover_df = None
 
         self._meta = {
             "n_shards": shard_idx,

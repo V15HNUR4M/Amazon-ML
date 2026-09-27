@@ -1347,9 +1347,7 @@ class Turn7Pipeline:
         for fname in shard_files_list:
             sp = shard_dir / fname
             if sp.exists():
-                tmp = pd.read_parquet(sp, columns=["entity_id", "name_norm",
-                                                   "name_compact", "address_norm",
-                                                   "country_norm"])
+                tmp = pd.read_parquet(sp, columns=["name_norm"])
                 ref_name_norms.append(tmp)
                 del tmp
         if ref_name_norms:
