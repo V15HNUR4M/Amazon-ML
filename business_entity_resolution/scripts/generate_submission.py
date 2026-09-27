@@ -109,18 +109,26 @@ except ImportError:
 
 
 def load_validated_model(cache_dir: Path) -> LightGBMMatcher:
-    """Load the Turn 5.5 LightGBM model from joblib file.
+    """Load the trained LightGBM model from joblib file.
+
+    Preferred model paths:
+    1. turn6_final_matcher.joblib
+    2. turn5_5_best_matcher.joblib
+    3. best_matcher.joblib
 
     LightGBMMatcher.load() is a @classmethod that returns a fully-fitted instance.
     We must capture and return its return value (not call it on a blank instance).
     """
-    model_path = cache_dir / "turn5_5_best_matcher.joblib"
+    model_path = cache_dir / "turn6_final_matcher.joblib"
+    if not model_path.exists():
+        model_path = cache_dir / "turn5_5_best_matcher.joblib"
     if not model_path.exists():
         model_path = cache_dir / "best_matcher.joblib"
     if not model_path.exists():
         raise FileNotFoundError(
             f"No trained model found in {cache_dir}. "
-            "Run scripts/run_validation_scale_check.py first."
+            "Searched for: turn6_final_matcher.joblib, turn5_5_best_matcher.joblib, best_matcher.joblib. "
+            "Run scripts/train_final_model.py or scripts/run_validation_scale_check.py first."
         )
     logger.info("Loading trained model from %s ...", model_path)
     # load() is a @classmethod — must use the returned fitted instance

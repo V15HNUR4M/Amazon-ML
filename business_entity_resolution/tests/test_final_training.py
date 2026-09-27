@@ -437,4 +437,51 @@ def test_sample_path_without_preloaded_data_uses_sample_db(synthetic_training_da
     assert not (cache_dir / "turn6_train_blocking.db").exists()
 
 
+def test_load_validated_model_search_order_and_error(tmp_path: Path):
+    """Test load_validated_model follows: turn6_final_matcher > turn5_5_best_matcher > best_matcher."""
+    from scripts.generate_submission import load_validated_model
+
+    fake_cache = tmp_path / "cache"
+    fake_cache.mkdir(parents=True)
+
+    # 1. When empty, raises FileNotFoundError listing all three paths
+    with pytest.raises(FileNotFoundError) as exc_info:
+        load_validated_model(fake_cache)
+    err_msg = str(exc_info.value)
+    assert "turn6_final_matcher.joblib" in err_msg
+    assert "turn5_5_best_matcher.joblib" in err_msg
+    assert "best_matcher.joblib" in err_msg
+
+    # Prepare fitted models
+    X = pd.DataFrame(np.random.rand(20, 21), columns=DEFAULT_FEATURE_NAMES)
+    y = np.array([0, 1] * 10)
+
+    m1 = LightGBMMatcher(n_estimators=2, random_state=1)
+    m1.fit(X, y)
+    m2 = LightGBMMatcher(n_estimators=3, random_state=2)
+    m2.fit(X, y)
+    m3 = LightGBMMatcher(n_estimators=4, random_state=3)
+    m3.fit(X, y)
+
+    p1 = fake_cache / "turn6_final_matcher.joblib"
+    p2 = fake_cache / "turn5_5_best_matcher.joblib"
+    p3 = fake_cache / "best_matcher.joblib"
+
+    # Only p3 exists -> loads p3
+    m3.save(p3)
+    loaded = load_validated_model(fake_cache)
+    assert loaded.n_estimators == 4
+
+    # Both p2 and p3 exist -> loads p2
+    m2.save(p2)
+    loaded = load_validated_model(fake_cache)
+    assert loaded.n_estimators == 3
+
+    # All three exist -> loads p1 (first preference)
+    m1.save(p1)
+    loaded = load_validated_model(fake_cache)
+    assert loaded.n_estimators == 2
+
+
+
 
