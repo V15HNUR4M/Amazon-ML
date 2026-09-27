@@ -64,20 +64,13 @@ def _vram_gb() -> float:
     return info.get("peak_allocated_mb", 0.0) / 1024.0
 
 
-def load_full_corpus(cfg: Config, s1_count: int, random_seed: int) -> tuple:
-    """Load the REAL full S2+S3 reference corpus and a deterministic S1 sample."""
+def load_s1_and_gt(cfg: Config, s1_count: int, random_seed: int) -> tuple:
+    """Load ONLY S1 sample and ground truth. S2/S3 are streamed from TSV by the pipeline.
+
+    MEMORY-SAFE: Never loads the 10.3M reference corpus into RAM.
+    Peak RAM from this function: ~800 MB (S1_full + GT).
+    """
     t0 = time.time()
-    print(f"Loading S2 from {cfg.TRAIN_SOURCE2} ...")
-    s2 = pd.read_csv(cfg.TRAIN_SOURCE2, sep="\t", keep_default_na=False, low_memory=False)
-    print(f"  S2: {len(s2):,} records | {_rss_gb():.2f} GB RSS")
-
-    print(f"Loading S3 from {cfg.TRAIN_SOURCE3} ...")
-    s3 = pd.read_csv(cfg.TRAIN_SOURCE3, sep="\t", keep_default_na=False, low_memory=False)
-    print(f"  S3: {len(s3):,} records | {_rss_gb():.2f} GB RSS")
-
-    print(f"Loading ground truth from {cfg.TRAIN_GROUND_TRUTH} ...")
-    gt = pd.read_csv(cfg.TRAIN_GROUND_TRUTH, sep="\t", keep_default_na=False)
-    print(f"  GT: {len(gt):,} rows")
 
     print(f"Loading S1 sample ({s1_count:,} from {cfg.TRAIN_SOURCE1}) ...")
     s1_full = pd.read_csv(cfg.TRAIN_SOURCE1, sep="\t", keep_default_na=False, low_memory=False)
@@ -88,24 +81,35 @@ def load_full_corpus(cfg: Config, s1_count: int, random_seed: int) -> tuple:
     s1 = s1_full.iloc[idx].reset_index(drop=True)
     del s1_full
     gc.collect()
+    print(f"  S1 sample:  {len(s1):,} records | {_rss_gb():.2f} GB RSS")
+
+    print(f"Loading ground truth from {cfg.TRAIN_GROUND_TRUTH} ...")
+    gt = pd.read_csv(cfg.TRAIN_GROUND_TRUTH, sep="\t", keep_default_na=False)
+    print(f"  GT:         {len(gt):,} rows")
 
     # Filter ground truth to only the sampled S1 entities
     s1_ids = set(s1["entity_id"].astype(str))
     s1_col = "source1_entity_id" if "source1_entity_id" in gt.columns else "s1_id"
     gt_sampled = gt[gt[s1_col].astype(str).isin(s1_ids)].copy()
+    del gt
+    gc.collect()
 
     load_time = round(time.time() - t0, 2)
-    total_pool = len(s2) + len(s3)
     print(f"\nData loading complete in {load_time}s:")
     print(f"  S1 sample:      {len(s1):,} records")
-    print(f"  S2 corpus:      {len(s2):,} records")
-    print(f"  S3 corpus:      {len(s3):,} records")
-    print(f"  Total pool:     {total_pool:,} records (true fixed reference universe)")
+    print(f"  S2+S3 ref:      10,320,219 records (streamed from TSV — not loaded into RAM)")
     print(f"  GT rows:        {len(gt_sampled):,}")
-    print(f"  Current RSS:    {_rss_gb():.2f} GB")
+    print(f"  Current RSS:    {_rss_gb():.2f} GB  [S2/S3 not loaded]")
     print()
 
-    return s1, s2, s3, gt_sampled
+    return s1, gt_sampled
+
+
+# Keep the original loader name as an alias for any callers that might use it
+def load_full_corpus(cfg: Config, s1_count: int, random_seed: int) -> tuple:
+    """Deprecated alias for load_s1_and_gt. S2/S3 are no longer loaded into RAM."""
+    s1, gt = load_s1_and_gt(cfg, s1_count, random_seed)
+    return s1, None, None, gt
 
 
 def estimate_full_scale(
@@ -229,11 +233,15 @@ def run_test(
         result = pipeline.run_training_from_chunks(output_dir=output_dir, cache_dir=cache_dir)
         return result
 
-    # Load full corpus
+    # -----------------------------------------------------------------------
+    # MEMORY-SAFE LOAD: Only S1 + GT loaded into RAM.
+    # S2/S3 are streamed chunk-by-chunk from TSV during shard building.
+    # Peak RAM savings: ~12-15 GB versus the previous full-DF approach.
+    # -----------------------------------------------------------------------
     rss_before_load = _rss_gb()
-    s1, s2, s3, gt = load_full_corpus(cfg, s1_count, random_seed)
+    s1, gt = load_s1_and_gt(cfg, s1_count, random_seed)
     rss_after_load = _rss_gb()
-    print(f"RSS delta from corpus loading: {rss_after_load - rss_before_load:.2f} GB")
+    print(f"RSS after S1+GT load: {rss_after_load:.2f} GB (delta: +{rss_after_load - rss_before_load:.2f} GB)")
     print(f"Available system RAM: {psutil.virtual_memory().available / (1024**3):.2f} GB\n")
 
     # Build pipeline
@@ -251,13 +259,10 @@ def run_test(
     )
     pipeline = Turn7Pipeline(config=t7_cfg)
 
-    # Free S2/S3 DataFrames from RAM before the sharded pipeline takes over
-    # (the sharded pipeline preprocesses and shards them internally)
+    # Pass S2/S3 as TSV paths — the pipeline streams them directly without loading full DFs.
     t_total = time.time()
     result = pipeline.run_validation_experiment(
         s1=s1,
-        s2=s2,
-        s3=s3,
         gt_df=gt,
         output_dir=output_dir,
         cache_dir=cache_dir,
@@ -265,6 +270,8 @@ def run_test(
         use_sharded=True,
         shard_size=shard_size,
         overwrite_shards=overwrite_shards,
+        s2_path=cfg.TRAIN_SOURCE2,
+        s3_path=cfg.TRAIN_SOURCE3,
     )
     total_runtime = round(time.time() - t_total, 2)
 

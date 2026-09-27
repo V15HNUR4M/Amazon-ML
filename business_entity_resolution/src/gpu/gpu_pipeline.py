@@ -165,6 +165,8 @@ class Turn7Pipeline:
         use_sharded: bool = False,
         shard_size: int = 200_000,
         overwrite_shards: bool = False,
+        s2_path: Optional["Path | str"] = None,
+        s3_path: Optional["Path | str"] = None,
     ) -> dict[str, Any]:
         """Execute complete Turn 7 validation experiment matching Turn 5.5 methodology.
 
@@ -179,6 +181,7 @@ class Turn7Pipeline:
         use_sharded: If True, use ShardedReferenceIndex for Colab-memory-safe full-corpus blocking.
         shard_size: Reference records per shard when use_sharded=True (default: 200_000).
         overwrite_shards: If True, force re-build of shard Parquet files on disk.
+        s2_path, s3_path: Optional TSV file paths for streaming shard building (memory-safe mode).
 
         Returns
         -------
@@ -197,6 +200,8 @@ class Turn7Pipeline:
                 use_sharded=use_sharded,
                 shard_size=shard_size,
                 overwrite_shards=overwrite_shards,
+                s2_path=s2_path,
+                s3_path=s3_path,
             )
 
         cfg = Config()
@@ -1207,15 +1212,22 @@ class Turn7Pipeline:
     def run_sharded_ingestion(
         self,
         s1: pd.DataFrame,
-        s2: pd.DataFrame,
-        s3: pd.DataFrame,
-        gt_df: pd.DataFrame,
+        s2: Optional[pd.DataFrame] = None,
+        s3: Optional[pd.DataFrame] = None,
+        gt_df: Optional[pd.DataFrame] = None,
         output_dir: Optional[Path] = None,
         cache_dir: Optional[Path] = None,
         shard_size: int = 200_000,
         overwrite_shards: bool = False,
+        s2_path: Optional["Path | str"] = None,
+        s3_path: Optional["Path | str"] = None,
     ) -> dict[str, Any]:
         """Execute Stages 1-4 using a disk-backed ShardedReferenceIndex.
+
+        Memory-efficient mode: supply ``s2_path`` / ``s3_path`` (TSV file paths)
+        instead of pre-loaded DataFrames. The method will stream those files
+        through preprocessing in 200 k-row chunks and write Parquet shards
+        **without ever holding the full S2/S3 corpus in RAM**.
 
         Enables candidate generation against a reference corpus (S2+S3) that is too
         large to fit in RAM (e.g. 10.32M records on a 12.7 GB Colab runtime).
@@ -1233,8 +1245,15 @@ class Turn7Pipeline:
 
         Parameters
         ----------
-        s1, s2, s3:
+        s1:
+            Source 1 DataFrame (query side, always required).
+        s2, s3:
             Source DataFrames. S2+S3 form the fixed reference universe.
+            Either pass pre-loaded DataFrames OR supply ``s2_path`` / ``s3_path``
+            to stream directly from disk (recommended for 30 GB-constrained environments).
+        s2_path, s3_path:
+            Paths to raw TSV files. When provided, the method streams and preprocesses
+            them in-place; ``s2`` / ``s3`` DataFrame args are ignored for shard building.
         gt_df:
             Ground truth DataFrame.
         output_dir:
@@ -1315,8 +1334,24 @@ class Turn7Pipeline:
             shard_size=shard_size,
         )
 
-        # Build/load shards from the FULL S2+S3 corpus
-        shard_meta = sharded_idx.build_shards(s2, s3, overwrite=overwrite_shards)
+        # --- Memory-safe shard build ---
+        # Prefer streaming from TSV files (zero full-DF peak RAM) over DF path.
+        tsv_paths = [p for p in (s2_path, s3_path) if p is not None]
+        if tsv_paths:
+            # Stream S2/S3 directly from disk — S2/S3 DataFrames never loaded.
+            shard_meta = sharded_idx.build_shards_from_files(
+                *tsv_paths,
+                overwrite=overwrite_shards,
+                chunk_size=shard_size,
+                n_jobs=4,
+            )
+        else:
+            # Fallback: build from pre-loaded DataFrames (legacy / small-scale use)
+            shard_meta = sharded_idx.build_shards(s2, s3, overwrite=overwrite_shards)
+            # Free reference DataFrames immediately after sharding
+            del s2, s3
+            gc.collect()
+
         peak_rss = max(peak_rss, get_process_rss_mb())
         print(
             f"  Reference Shards: {shard_meta['n_shards']} shards x ~{shard_size:,} records "
@@ -1328,37 +1363,23 @@ class Turn7Pipeline:
         peak_rss = max(peak_rss, get_process_rss_mb())
         print(f"  Global Vocab: {len(sharded_idx.token_freq):,} tokens | RSS: {get_process_rss_mb():.2f} MB")
 
-        # Fit IDF store (used by GPU feature extraction) — stream shards to avoid loading all at once
+        # Fit IDF store (used by GPU feature extraction) — stream shards one at a time
         print("  Fitting IDF store (streaming over shards)...")
-        # We need to pass representative corpora to idf_store.fit(). We use S1_proc plus
-        # a streaming approach: read each shard parquet and update token counts.
-        # TokenIDFStore.fit() expects DataFrames; build a lightweight proxy by reading shards.
-        from src.gpu.gpu_features import TokenIDFStore  # noqa: PLC0415 (local import for clarity)
+        from src.gpu.gpu_features import TokenIDFStore  # noqa: PLC0415
         self.idf_store = TokenIDFStore()
-        # Pass s1_proc and stream-accumulate a representative reference sample for IDF.
-        # Fit over all shards sequentially to get correct corpus-level IDF.
-        shard_files_list = shard_meta["shard_files"]
-        n_shards_total = len(shard_files_list)
-        # To avoid re-holding all refs in RAM, we fit incrementally:
-        # idf_store.fit takes *dfs; we call it once per shard with reset=False style.
-        # However the existing API expects a single fit call. So we collect just the
-        # name_norm column from each shard (lightweight) and pass the full s1_proc once.
-        ref_name_norms: list[pd.Series] = []
-        for fname in shard_files_list:
+        self.idf_store.start_incremental()
+        # Accumulate S1 first
+        self.idf_store.fit_incremental(s1_proc)
+        # Then stream each shard individually — peak RAM = one shard at a time
+        for fname in shard_meta["shard_files"]:
             sp = shard_dir / fname
             if sp.exists():
                 tmp = pd.read_parquet(sp, columns=["name_norm"])
-                ref_name_norms.append(tmp)
+                self.idf_store.fit_incremental(tmp)
                 del tmp
-        if ref_name_norms:
-            ref_combined = pd.concat(ref_name_norms, ignore_index=True)
-            del ref_name_norms
-            gc.collect()
-            self.idf_store.fit(s1_proc, ref_combined)
-            del ref_combined
-            gc.collect()
-        else:
-            self.idf_store.fit(s1_proc)
+        self.idf_store.finalize()
+        gc.collect()
+
 
         timing["preprocessing_s"] = round(time.time() - t0, 2)
         peak_rss = max(peak_rss, get_process_rss_mb())
@@ -1695,6 +1716,8 @@ class Turn7Pipeline:
         use_sharded: bool = False,
         shard_size: int = 200_000,
         overwrite_shards: bool = False,
+        s2_path: Optional["Path | str"] = None,
+        s3_path: Optional["Path | str"] = None,
     ) -> dict[str, Any]:
         """Execute memory-safe streaming validation experiment.
 
@@ -1702,6 +1725,8 @@ class Turn7Pipeline:
         - ingest_only / train_only: process-boundary isolation.
         - use_sharded: route candidate generation through ShardedReferenceIndex
           for Colab-safe handling of the full 10.32M reference corpus.
+        - s2_path / s3_path: stream reference TSV directly to shards; S2/S3 DFs
+          never loaded into RAM (recommended for 30 GB Kaggle environments).
         """
         if train_only:
             return self.run_training_from_chunks(output_dir=output_dir, cache_dir=cache_dir, gt_df=gt_df)
@@ -1711,6 +1736,7 @@ class Turn7Pipeline:
                 s1=s1, s2=s2, s3=s3, gt_df=gt_df,
                 output_dir=output_dir, cache_dir=cache_dir,
                 shard_size=shard_size, overwrite_shards=overwrite_shards,
+                s2_path=s2_path, s3_path=s3_path,
             )
         else:
             ingestion_summary = self.run_streaming_ingestion(
@@ -1721,4 +1747,6 @@ class Turn7Pipeline:
             return ingestion_summary
 
         return self.run_training_from_chunks(output_dir=output_dir, cache_dir=cache_dir, gt_df=gt_df)
+
+
 

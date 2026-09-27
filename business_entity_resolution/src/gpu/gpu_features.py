@@ -264,7 +264,7 @@ class TokenIDFStore:
         self.total_docs: int = 1
         self.default_idf: float = 5.0
 
-    def fit(self, *dfs: pd.DataFrame) -> TokenIDFStore:
+    def fit(self, *dfs: pd.DataFrame) -> "TokenIDFStore":
         """Precompute token IDF table from source DataFrames."""
         doc_freq: Counter[str] = Counter()
         doc_count = 0
@@ -288,6 +288,51 @@ class TokenIDFStore:
         self.default_idf = math.log(1.0 + (self.total_docs + 1))
         logger.info(
             "Computed IDF store across %d records (%d unique tokens)",
+            self.total_docs,
+            len(self.idf_table),
+        )
+        return self
+
+    # ------ Streaming / incremental IDF for large corpora ------------------
+
+    def start_incremental(self) -> None:
+        """Reset internal accumulators for incremental (shard-by-shard) IDF fitting."""
+        self._inc_doc_freq: Counter[str] = Counter()
+        self._inc_doc_count: int = 0
+
+    def fit_incremental(self, df: pd.DataFrame) -> None:
+        """Accumulate token document frequencies from a single DataFrame shard.
+
+        Call ``start_incremental()`` once before the first shard, then call this
+        method for each shard in sequence, and finally call ``finalize()``.
+        Peak RAM per call = size of ``df`` only — no global accumulation of rows.
+        """
+        if df is None or len(df) == 0:
+            return
+        name_col = "name_norm" if "name_norm" in df.columns else "business_name"
+        for val in df[name_col].dropna():
+            self._inc_doc_count += 1
+            unique_tokens = set(str(val).split())
+            for t in unique_tokens:
+                if len(t) >= 2:
+                    self._inc_doc_freq[t] += 1
+
+    def finalize(self) -> "TokenIDFStore":
+        """Compute the final IDF table from accumulated incremental state.
+
+        Must be called after all shards have been passed to ``fit_incremental()``.
+        """
+        self.total_docs = max(getattr(self, "_inc_doc_count", 0), 1)
+        self.idf_table = {
+            t: math.log(1.0 + (self.total_docs + 1) / (count + 1))
+            for t, count in getattr(self, "_inc_doc_freq", {}).items()
+        }
+        self.default_idf = math.log(1.0 + (self.total_docs + 1))
+        # Release accumulators
+        self._inc_doc_freq = Counter()
+        self._inc_doc_count = 0
+        logger.info(
+            "Finalized IDF store across %d records (%d unique tokens)",
             self.total_docs,
             len(self.idf_table),
         )

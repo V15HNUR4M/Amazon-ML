@@ -1111,6 +1111,148 @@ class ShardedReferenceIndex:
         )
         return self._meta
 
+    def build_shards_from_files(
+        self,
+        *tsv_paths: "Path | str",
+        overwrite: bool = False,
+        chunk_size: int = 200_000,
+        n_jobs: int = 4,
+    ) -> dict[str, Any]:
+        """Stream TSV files chunk-by-chunk, preprocess, and write Parquet shards.
+
+        ZERO peak-RAM design:
+        - Reads source TSV files in ``chunk_size`` row batches.
+        - Preprocesses each batch with ``n_jobs`` parallel workers.
+        - Immediately writes completed shard files to disk.
+        - Peak RAM is bounded to: ``chunk_size × ~3 KB ≈ 600 MB`` per TSV chunk.
+        - The full S2/S3 DataFrames are NEVER held in memory simultaneously.
+
+        Parameters
+        ----------
+        *tsv_paths:
+            Paths to TSV source files (e.g. train_source2.tsv, train_source3.tsv).
+        overwrite:
+            If True, delete and re-create all shard files.
+        chunk_size:
+            Number of TSV rows processed at a time (default: 200_000).
+            Should match ``self.shard_size`` for uniform shard sizes.
+        n_jobs:
+            Number of parallel preprocessing workers (default: 4).
+
+        Returns
+        -------
+        dict with shard metadata identical to ``build_shards``.
+        """
+        meta_path = self.shard_dir / self.SHARD_META_FILE
+        if meta_path.exists() and not overwrite:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                self._meta = json.load(f)
+            logger.info(
+                "ShardedReferenceIndex: loaded existing %d shards (%d total records) from %s",
+                self._meta.get("n_shards", 0),
+                self._meta.get("total_records", 0),
+                self.shard_dir,
+            )
+            return self._meta
+
+        # Delete stale shard files
+        for old in self.shard_dir.glob("ref_shard_*.parquet"):
+            old.unlink(missing_ok=True)
+
+        COLS_TO_KEEP = [
+            "entity_id", "business_name",
+            "name_norm", "name_compact", "name_no_suffix",
+            "address_norm", "address_is_missing",
+            "country_norm", "name_script", "is_domain",
+            "domain_stem", "legal_suffix",
+        ]
+
+        shard_idx = 0
+        total_records = 0
+        shard_files: list[str] = []
+        leftover_df: Optional[pd.DataFrame] = None
+
+        def _write_shard_df(df_chunk: pd.DataFrame) -> None:
+            nonlocal shard_idx
+            if df_chunk is None or len(df_chunk) == 0:
+                return
+            keep = [c for c in COLS_TO_KEEP if c in df_chunk.columns]
+            shard_df = df_chunk[keep]
+            fname = f"ref_shard_{shard_idx:04d}.parquet"
+            shard_df.to_parquet(
+                self.shard_dir / fname,
+                index=False,
+                engine="pyarrow",
+                compression="snappy",
+            )
+            shard_files.append(fname)
+            shard_idx += 1
+            logger.info(
+                "ShardedReferenceIndex: streamed shard %d with %d records -> %s",
+                shard_idx - 1,
+                len(shard_df),
+                fname,
+            )
+
+        for tsv_path in tsv_paths:
+            tsv_path = Path(tsv_path)
+            if not tsv_path.exists():
+                logger.warning("ShardedReferenceIndex: TSV path not found: %s", tsv_path)
+                continue
+
+            logger.info("ShardedReferenceIndex: streaming %s ...", tsv_path)
+            reader = pd.read_csv(
+                tsv_path,
+                sep="\t",
+                dtype=str,
+                chunksize=chunk_size,
+                keep_default_na=False,
+            )
+
+            for raw_chunk in reader:
+                # Preprocess chunk using 4 worker processes
+                proc_chunk = preprocess_records(raw_chunk, in_place=True, n_jobs=n_jobs)
+                del raw_chunk
+                total_records += len(proc_chunk)
+
+                # Prepend any leftover rows from the previous chunk
+                if leftover_df is not None and len(leftover_df) > 0:
+                    proc_chunk = pd.concat([leftover_df, proc_chunk], ignore_index=True)
+                    leftover_df = None
+
+                # Write complete shard(s)
+                n_full = len(proc_chunk) // self.shard_size
+                for i in range(n_full):
+                    _write_shard_df(proc_chunk.iloc[i * self.shard_size : (i + 1) * self.shard_size])
+
+                rem_start = n_full * self.shard_size
+                if rem_start < len(proc_chunk):
+                    leftover_df = proc_chunk.iloc[rem_start:].copy()
+
+                del proc_chunk
+                gc.collect()
+
+        # Flush remaining records
+        if leftover_df is not None and len(leftover_df) > 0:
+            _write_shard_df(leftover_df)
+            leftover_df = None
+
+        self._meta = {
+            "n_shards": shard_idx,
+            "total_records": total_records,
+            "shard_size": self.shard_size,
+            "shard_files": shard_files,
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(self._meta, f, indent=2)
+        logger.info(
+            "ShardedReferenceIndex: built %d shards across %d total records in %s",
+            shard_idx,
+            total_records,
+            self.shard_dir,
+        )
+        return self._meta
+
     # ------------------------------------------------------------------
     # Global vocabulary (run once, reuse across S1 batches)
     # ------------------------------------------------------------------
